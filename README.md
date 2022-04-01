@@ -1,6 +1,8 @@
 # ctf-scripts
 A collection of scripts I've written to solve recurring challenges in CTFs.
 
+If you find any of these useful, please consider giving the repo a star :pleading_face:
+
 ## Scripts
 
 - `change_jpeg_dimensions.py`:
