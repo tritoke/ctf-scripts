@@ -4,24 +4,95 @@ import struct
 import binascii
 import random
 import itertools as it
+from dataclasses import dataclass, field
+from io import BytesIO
 
 VERB = 0
 
 
-def read_header(pngfile):
+@dataclass
+class Chunk:
+    length: int
+    type: str
+    data: bytes
+    crc: int = field(default=0)
+
+    def pack(self) -> bytes:
+        return (
+            struct.pack(">I", self.length)
+            + self.type.encode("UTF-8")
+            + self.data
+            + struct.pack("!I", self.crc)
+        )
+
+    def recalc_crc(self):
+        self.crc = binascii.crc32(self.type.encode() + self.data)
+
+    def log(self, action: str):
+        if VERB > 0:
+            print(f"{action} {self.type} chunk")
+
+        if VERB > 1:
+            print(f"\tlength = {self.length}")
+
+        if VERB > 2:
+            print(f"\tdata = {self.data}")
+
+        if VERB > 1:
+            print(f"\tcrc = {self.crc:08X}")
+
+
+@dataclass
+class PngMetadata:
+    width: int
+    height: int
+    bit_depth: int
+    color_type: int
+    compression_method: int
+    filter_method: int
+    interlace_method: int
+
+    def __init__(self, data: bytes):
+        (
+            self.width,
+            self.height,
+            self.bit_depth,
+            self.color_type,
+            self.compression_method,
+            self.filter_method,
+            self.interlace_method,
+        ) = struct.unpack(">IIBBBBB", data)
+
+        if VERB > 2:
+            print(f"Parsed IHDR: {self}")
+
+    def pack(self) -> bytes:
+        return struct.pack(
+            ">IIBBBBB",
+            self.width,
+            self.height,
+            self.bit_depth,
+            self.color_type,
+            self.compression_method,
+            self.filter_method,
+            self.interlace_method,
+        )
+
+
+def read_header(pngfile: BytesIO) -> bytes:
     header = pngfile.read(8)
     if VERB > 2:
         print(f"Read header: {header}")
     return header
 
 
-def write_header(pngfile, header):
+def write_header(pngfile: BytesIO, header: bytes):
     pngfile.write(header)
     if VERB > 2:
         print(f"Wrote header: {header}")
 
 
-def read_chunk(pngfile):
+def read_chunk(pngfile: BytesIO) -> Chunk | None:
     try:
         (length,) = struct.unpack(">I", pngfile.read(4))
         chunk_type = pngfile.read(4).decode()
@@ -30,92 +101,50 @@ def read_chunk(pngfile):
     except struct.error:
         return None
 
-    if VERB > 0:
-        print(f"Read {chunk_type} chunk")
+    chunk = Chunk(length, chunk_type, chunk_data, crc)
 
-    if VERB > 1:
-        print(f"\tlength = {length}")
-
-    if VERB > 2:
-        print(f"\tdata = {chunk_data}")
-
-    if VERB > 1:
-        print(f"\tcrc = {crc:08X}")
+    chunk.log(action="Read")
+    return chunk
 
 
-    return length, chunk_type, chunk_data, crc
+def write_chunk(pngfile: BytesIO, chunk: Chunk):
+    pngfile.write(chunk.pack())
+    chunk.log(action="Wrote")
 
 
-def write_chunk(pngfile, chunk):
-    l, ct, cd, crc = chunk
-
-    if VERB > 0:
-        print(f"Wrote {ct} chunk")
-
-    if VERB > 1:
-        print(f"\tlength = {l}")
-
-    if VERB > 2:
-        print(f"\tdata = {cd}")
-
-    if VERB > 1:
-        print(f"\tcrc = {crc:08X}")
-
-    pngfile.write(
-        struct.pack(">I", l)
-        + ct.encode("UTF-8")
-        + cd
-        + struct.pack("!I", crc)
-    )
-
-
-def parse_ihdr_data(cd):
-    items = struct.unpack(">IIBBBBB", cd)
-    if VERB > 2:
-        print("Parsed IHDR: ", *items)
-
-    return items
-
-
-def calc_crc(ct, data):
-    return binascii.crc32(ct.encode() + data)
-
-
-def recalc_chunk_crc(l, ct, cd):
-    return (l, ct, cd, calc_crc(ct, cd))
-
-
-def bruteforce_ihdr_dimensions(chunk):
-    l, ct, cd, crc = chunk
-    xl, yl, bd, col_t, cm, fm, im = parse_ihdr_data(cd)
-
+def bruteforce_ihdr_dimensions(chunk: Chunk) -> Chunk:
     for i, j in it.product(range(1, 10000), range(1, 10000)):
-        new_data = struct.pack(">II", i, j) + cd[8:]
+        new_chunk = chunk
+        new_chunk.data = struct.pack(">II", i, j) + chunk.data[8:]
+        new_chunk.recalc_crc()
 
         if VERB > 2:
             print(f"trying: width = {i}, height = {j}")
 
-        if calc_crc(ct, new_data) == crc:
+        if new_chunk.crc == chunk.crc:
             if VERB > 0:
                 print(f"found matching CRC, width = {i}, height = {j}")
 
-            return (l, ct, new_data, crc)
+            return new_chunk
 
-    return chunk
+    raise Exception("Failed to find valid size by bruteforce")
 
 
 def randomise_plte(chunk):
-    l, ct, *_ = chunk
-
-    cd = random.randbytes(l)
+    new_chunk = Chunk(
+        length=chunk.length,
+        type=chunk.type,
+        data=random.randbytes(chunk.length),
+    )
+    new_chunk.recalc_crc()
 
     if VERB > 0:
         print("Generated random PLTE chunk.")
 
     if VERB > 2:
-        print(f"\tdata = {cd}.")
+        print(f"\tdata = {chunk.data}.")
 
-    return recalc_chunk_crc(l, ct, cd)
+    return new_chunk
 
 
 def parse_file_chunks(input_file):
@@ -126,13 +155,13 @@ def parse_file_chunks(input_file):
     return chunks
 
 
-def parse_png(input_file):
+def parse_png(input_file) -> tuple[bytes, list[Chunk]]:
     header = read_header(input_file)
     chunks = parse_file_chunks(input_file)
     return header, chunks
 
 
-def save_png(output_file, header, chunks):
+def save_png(output_file: BytesIO, header: bytes, chunks: list[Chunk]):
     write_header(output_file, header)
     for chunk in chunks:
         write_chunk(output_file, chunk)
@@ -141,9 +170,21 @@ def save_png(output_file, header, chunks):
 @click.command()
 @click.argument("input-file", type=click.File("rb"))
 @click.argument("output-file", type=click.File("wb"))
-@click.option("--fix-ihdr/--no-fix-ihdr",   default=False, help="Brute force values to find the right dimensions for the image, using the CRC to verify the chunk data.")
-@click.option("--rand-plte/--no-rand-plte", default=False, help="Insert random data into the PLTE chunk if one exists.")
-@click.option("--fix-crc/--no-fix-crc",     default=False, help="Re-calculate the CRC for every chunk.")
+@click.option(
+    "--fix-ihdr/--no-fix-ihdr",
+    default=False,
+    help="Brute force values to find the right dimensions for the image, using the CRC to verify the chunk data.",
+)
+@click.option(
+    "--rand-plte/--no-rand-plte",
+    default=False,
+    help="Insert random data into the PLTE chunk if one exists.",
+)
+@click.option(
+    "--fix-crc/--no-fix-crc",
+    default=False,
+    help="Re-calculate the CRC for every chunk.",
+)
 @click.option("--verbosity", default=0, help="Set the verbosity level.")
 def main(input_file, output_file, fix_ihdr, rand_plte, fix_crc, verbosity):
     global VERB
@@ -153,23 +194,31 @@ def main(input_file, output_file, fix_ihdr, rand_plte, fix_crc, verbosity):
 
     if fix_ihdr:
         chunks = [
-            bruteforce_ihdr_dimensions(chunk) if chunk[1] == "IHDR" else chunk
+            bruteforce_ihdr_dimensions(chunk) if chunk.type == "IHDR" else chunk
             for chunk in chunks
         ]
 
     if rand_plte:
         chunks = [
-            randomise_plte(chunk) if chunk[1] == "PLTE" else chunk
-            for chunk in chunks
+            randomise_plte(chunk) if chunk.type == "PLTE" else chunk for chunk in chunks
         ]
+
+    chunks = [
+        chunks[0],
+        Chunk(
+            length=sum(chunk.length for chunk in chunks),
+            type="IDAT",
+            data=b"".join(chunk.data for chunk in chunks),
+        ),
+        chunks[-1],
+    ]
 
     if fix_crc:
-        chunks = [
-            recalc_chunk_crc(*chunk[:3])
-            for chunk in chunks
-        ]
+        for chunk in chunks:
+            chunk.recalc_crc()
 
     save_png(output_file, header, chunks)
+
 
 if __name__ == "__main__":
     main()
