@@ -18,12 +18,7 @@ class Chunk:
     crc: int = field(default=0)
 
     def pack(self) -> bytes:
-        return (
-            struct.pack(">I", self.length)
-            + self.type.encode("UTF-8")
-            + self.data
-            + struct.pack("!I", self.crc)
-        )
+        return struct.pack(">I", self.length) + self.type.encode("UTF-8") + self.data + struct.pack("!I", self.crc)
 
     def recalc_crc(self):
         self.crc = binascii.crc32(self.type.encode() + self.data)
@@ -193,25 +188,10 @@ def main(input_file, output_file, fix_ihdr, rand_plte, fix_crc, verbosity):
     header, chunks = parse_png(input_file)
 
     if fix_ihdr:
-        chunks = [
-            bruteforce_ihdr_dimensions(chunk) if chunk.type == "IHDR" else chunk
-            for chunk in chunks
-        ]
+        chunks = [(bruteforce_ihdr_dimensions(chunk) if chunk.type == "IHDR" else chunk) for chunk in chunks]
 
     if rand_plte:
-        chunks = [
-            randomise_plte(chunk) if chunk.type == "PLTE" else chunk for chunk in chunks
-        ]
-
-    chunks = [
-        chunks[0],
-        Chunk(
-            length=sum(chunk.length for chunk in chunks),
-            type="IDAT",
-            data=b"".join(chunk.data for chunk in chunks),
-        ),
-        chunks[-1],
-    ]
+        chunks = [randomise_plte(chunk) if chunk.type == "PLTE" else chunk for chunk in chunks]
 
     if fix_crc:
         for chunk in chunks:
