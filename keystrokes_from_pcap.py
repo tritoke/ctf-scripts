@@ -52,7 +52,8 @@ def main():
 
     print(data)
 
-# add any missing ones based on wireshark's dissection
+# These are from USB HID usage tables
+# https://source.android.com/docs/core/interaction/input/keyboard-devices
 keymap = {
     (False, 0x04): "a", (True, 0x04): "A",
     (False, 0x05): "b", (True, 0x05): "B",
@@ -91,7 +92,7 @@ keymap = {
     (False, 0x26): "9", (True, 0x26): "(",
     (False, 0x27): "0", (True, 0x27): ")",
     (False, 0x28): "\n",(True, 0x28): "\n",
-    (False, 0x2A): "[DEL]",(True, 0x28): "[DEL]",
+    (False, 0x2A): "[DEL]",(True, 0x2A): "[DEL]",
     (False, 0x2C): " ", (True, 0x2C): " ",
     (False, 0x2D): "-", (True, 0x2D): "_",
     (False, 0x2F): "[", (True, 0x2F): "{",
@@ -100,9 +101,9 @@ keymap = {
     (False, 0x32): "#", (True, 0x32): "~",
     (False, 0x33): ";", (True, 0x33): ":",
     (False, 0x34): "'", (True, 0x34): "@",
-    (False, 0x36): ",", (True, 0x36): ",",
-    (False, 0x37): ".", (True, 0x37): ".",
-    (False, 0x38): "/", (True, 0x38): "/",
+    (False, 0x36): ",", (True, 0x36): "<",
+    (False, 0x37): ".", (True, 0x37): ">",
+    (False, 0x38): "/", (True, 0x38): "?",
     (False, CAPSLOCK_SCANCODE): CAPSLOCK_SENTINEL, (True, CAPSLOCK_SCANCODE): CAPSLOCK_SENTINEL,
 }
 
