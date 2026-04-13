@@ -23,15 +23,28 @@ class ColorType(enum.IntEnum):
     TruecolorAlpha = 0b110
 
 
+class InterlaceMethod(enum.IntEnum):
+    Null = 0
+    Adam7 = 1
+
+
+class FilterMethod(enum.IntEnum):
+    AdaptiveFiltering = 0
+
+
+class CompressionMethod(enum.IntEnum):
+    Deflate = 0
+
+
 @dataclass
 class PngMetadata:
     width: int
     height: int
     bit_depth: int
     color_type: ColorType
-    compression_method: int
-    filter_method: int
-    interlace_method: int
+    compression_method: CompressionMethod
+    filter_method: FilterMethod
+    interlace_method: InterlaceMethod
 
     def from_bytes(data: bytes):
         (
@@ -49,9 +62,9 @@ class PngMetadata:
             height=height,
             bit_depth=bit_depth,
             color_type=ColorType(color_type),
-            compression_method=compression_method,
-            filter_method=filter_method,
-            interlace_method=interlace_method,
+            compression_method=CompressionMethod(compression_method),
+            filter_method=FilterMethod(filter_method),
+            interlace_method=InterlaceMethod(interlace_method),
         )
         LOGGER.log(TRACE, "Parsed IHDR: %s", meta)
 
@@ -73,14 +86,14 @@ class PngMetadata:
 @dataclass
 class Chunk:
     length: int
-    type: str
+    type: bytes
     data: bytes
     crc: int = field(default=0)
 
     def __post_init__(self):
-        if binascii.crc32(self.type.encode() + self.data) != self.crc:
+        if binascii.crc32(self.type + self.data) != self.crc:
             LOGGER.warning("CRC32 for %s chunk is incorrect", self.type)
-            if self.type == "IHDR":
+            if self.type == b"IHDR":
                 LOGGER.warning(
                     "Metadata contents: %s", PngMetadata.from_bytes(self.data)
                 )
@@ -88,13 +101,13 @@ class Chunk:
     def __bytes__(self) -> bytes:
         return (
             struct.pack(">I", self.length)
-            + self.type.encode("UTF-8")
+            + self.type
             + self.data
             + struct.pack("!I", self.crc)
         )
 
     def recalc_crc(self):
-        self.crc = binascii.crc32(self.type.encode() + self.data)
+        self.crc = binascii.crc32(self.type + self.data)
 
     def log(self, action: str):
         LOGGER.info("%s %s chunk", action, self.type)
@@ -105,6 +118,8 @@ class Chunk:
 
 def read_header(pngfile: Reader[bytes]) -> bytes:
     header = pngfile.read(8)
+    if header != b"\x89PNG\r\n\x1a\n":
+        LOGGER.error("%s is not a PNG file", header)
     LOGGER.log(TRACE, "Read header: %s", header)
     return header
 
@@ -117,7 +132,7 @@ def write_header(pngfile: Writer[bytes], header: bytes):
 def read_chunk(pngfile: Reader[bytes]) -> Chunk | None:
     try:
         (length,) = struct.unpack(">I", pngfile.read(4))
-        chunk_type = pngfile.read(4).decode()
+        chunk_type = pngfile.read(4)
         chunk_data = pngfile.read(length)
         (crc,) = struct.unpack("!I", pngfile.read(4))
     except struct.error:
@@ -146,13 +161,12 @@ def set_metadata_property(chunk: Chunk, kv_pair: str) -> Chunk:
         LOGGER.warning("Valid properties: %s", meta.keys())
         return chunk
 
-    if key == "color_type":
-        meta[key] = ColorType(value)
-    else:
-        meta[key] = value
+    curr_value_type = meta[key].__class__
+    meta[key] = curr_value_type(value)
 
     chunk = Chunk(chunk.length, chunk.type, bytes(PngMetadata(**meta)))
     chunk.recalc_crc()
+
     return chunk
 
 
@@ -174,7 +188,7 @@ def bruteforce_ihdr_dimensions(chunk: Chunk) -> Chunk:
     )
 
 
-def randomise_plte(chunk):
+def randomise_plte(chunk: Chunk):
     new_chunk = Chunk(
         length=chunk.length,
         type=chunk.type,
@@ -188,10 +202,21 @@ def randomise_plte(chunk):
     return new_chunk
 
 
-def parse_file_chunks(input_file):
+def parse_file_chunks(input_file: Reader[bytes]):
     chunks = []
     while (chunk := read_chunk(input_file)) is not None:
         chunks.append(chunk)
+        if chunk.type == b"IEND":
+            break
+
+    excess = input_file.read()
+    if len(excess) != 0:
+        try:
+            with open("excess", "wb") as f:
+                f.write(excess)
+            LOGGER.warning("Excess data detected and saved to ./excess")
+        except Exception as e:
+            LOGGER.warning("Excess data detected but failed to save", exc_info=e)
 
     return chunks
 
@@ -217,7 +242,7 @@ def detect_excess_data(chunks: list[Chunk]):
 
     try:
         compressed_data = b"".join(
-            chunk.data for chunk in chunks if chunk.type == "IDAT"
+            chunk.data for chunk in chunks if chunk.type == b"IDAT"
         )
         data = zlib.decompress(compressed_data)
     except Exception as e:
@@ -231,11 +256,11 @@ def detect_excess_data(chunks: list[Chunk]):
         case (8 | 16, ColorType.Truecolor):
             pixel_size_bits = meta.bit_depth * 3
         case (1 | 2 | 4 | 8, ColorType.Indexed):
-            pixel_size_bits = 8
+            pixel_size_bits = meta.bit_depth
         case (8 | 16, ColorType.GreyscaleAlpha):
             pixel_size_bits = meta.bit_depth * 2
         case (8 | 16, ColorType.TruecolorAlpha):
-            pixel_size_bits = meta.bit_depth * 3
+            pixel_size_bits = meta.bit_depth * 4
         case _:
             LOGGER.error(
                 "Cannot check for excess data, header has illegal combination of bit_depth (%d) and color_type (%s)",
@@ -245,19 +270,48 @@ def detect_excess_data(chunks: list[Chunk]):
             return
 
     # 1 for the filter byte
-    scanline_size_bytes = 1 + (pixel_size_bits * meta.width + 7) // 8
-    correct_data_size = scanline_size_bytes * meta.height
+    if meta.interlace_method == 0:
+        scanline_size_bytes = 1 + (pixel_size_bits * meta.width + 7) // 8
+        calc_data_size = scanline_size_bytes * meta.height
+    else:
+        # fml I guess this is where I finally understand adam7
+        adam7 = [
+            [1, 6, 4, 6, 2, 6, 4, 6],
+            [7, 7, 7, 7, 7, 7, 7, 7],
+            [5, 6, 5, 6, 5, 6, 5, 6],
+            [7, 7, 7, 7, 7, 7, 7, 7],
+            [3, 6, 4, 6, 3, 6, 4, 6],
+            [7, 7, 7, 7, 7, 7, 7, 7],
+            [5, 6, 5, 6, 5, 6, 5, 6],
+            [7, 7, 7, 7, 7, 7, 7, 7],
+        ]
 
-    if len(data) < correct_data_size:
+        calc_data_size = 0
+        for y in range(meta.height):
+            num_px_in_scanline = {i:0 for i in range(1, 8)}
+            for x in range(meta.width):
+                adam7_pass = adam7[y % 8][x % 8]
+                num_px_in_scanline[adam7_pass] += 1
+
+            # add on the size of each scanline for this row
+            for num_px in num_px_in_scanline.values():
+                if num_px == 0:
+                    continue
+
+                calc_data_size += 1 + (num_px * pixel_size_bits + 7) // 8
+
+    if len(data) < calc_data_size:
         LOGGER.warning("There is less data in the IDAT chunks than expected")
-    elif len(data) > correct_data_size:
+    elif len(data) > calc_data_size:
         LOGGER.warning("There is more data in the IDAT chunks than expected")
     else:
         return
 
-    LOGGER.warning(
-        "len(data) = %d, correct_data_size = %d", len(data), correct_data_size
-    )
+    LOGGER.warning("len(data) = %d, calc_data_size = %d", len(data), calc_data_size)
+
+    if meta.interlace_method == 1:
+        return
+
     if len(data) % scanline_size_bytes != 0:
         LOGGER.warning("Scanline size does not divide data size, width probably wrong")
     else:
@@ -291,6 +345,7 @@ def argument_parser() -> ArgumentParser:
         required=False,
         help="Change a PNG metadata property, e.g. --set height=1200",
     )
+    parser.add_argument("--print-metadata", required=False, action="store_true")
 
     return parser
 
@@ -301,7 +356,7 @@ def main():
         5 if args.log_level.upper() == "TRACE" else args.log_level.upper()
     )
 
-    # create console handler with a higher log level
+    # create console handler with a lower log level than debug
     LOGGER.setLevel(level)
     ch = logging.StreamHandler()
     ch.setLevel(level)
@@ -311,21 +366,26 @@ def main():
     input_file = open(args.input_file, "rb")
     header, chunks = parse_png(input_file)
 
+    if args.print_metadata:
+        meta = PngMetadata.from_bytes(chunks[0].data)
+        print(meta)
+
     if args.set:
         chunks = [
-            (set_metadata_property(chunk, args.set) if chunk.type == "IHDR" else chunk)
+            (set_metadata_property(chunk, args.set) if chunk.type == b"IHDR" else chunk)
             for chunk in chunks
         ]
 
     if args.fix_ihdr:
         chunks = [
-            (bruteforce_ihdr_dimensions(chunk) if chunk.type == "IHDR" else chunk)
+            (bruteforce_ihdr_dimensions(chunk) if chunk.type == b"IHDR" else chunk)
             for chunk in chunks
         ]
 
     if args.rand_plte:
         chunks = [
-            randomise_plte(chunk) if chunk.type == "PLTE" else chunk for chunk in chunks
+            randomise_plte(chunk) if chunk.type == b"PLTE" else chunk
+            for chunk in chunks
         ]
 
     if args.fix_crc:
